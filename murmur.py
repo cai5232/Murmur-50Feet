@@ -135,6 +135,18 @@ def status():
  for n,d in D.items():
   print(f" {n}({d['z']}):{d['v']:.2f} {'█'*int(d['v']*10)}")
 
+def load_state():
+ global _offline_ticks
+ if not STATE.exists():return
+ try:
+  state=json.loads(STATE.read_text(encoding="utf-8"))
+  drives=state.get("drives",{})
+  for name,values in drives.items():
+   if name in D and isinstance(values,dict) and isinstance(values.get("v"),(int,float)):
+    D[name]["v"]=cl(float(values["v"]))
+  _offline_ticks=max(0,int(state.get("offlineTicks",0)))
+ except Exception as e:print(f"[state恢复失败]{e}")
+
 def dump_state():
  now=datetime.now().astimezone()
  state={"time":now.isoformat(),"offlineTicks":_offline_ticks,
