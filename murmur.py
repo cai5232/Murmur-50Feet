@@ -23,6 +23,7 @@ ATT_RESET=0.40
 ARC=DATA_DIR/"arc.jsonl"
 REGRET_LOG=DATA_DIR/"regret.jsonl"
 STATE=DATA_DIR/"state.json"
+HISTORY=DATA_DIR/"history.jsonl"
 NTFY=os.environ.get("MURMUR_NTFY","")
 
 D={
@@ -135,10 +136,22 @@ def status():
   print(f" {n}({d['z']}):{d['v']:.2f} {'█'*int(d['v']*10)}")
 
 def dump_state():
- state={"time":datetime.now().isoformat()[:16],
+ now=datetime.now().astimezone()
+ state={"time":now.isoformat(),"offlineTicks":_offline_ticks,
         "drives":{n:{"v":round(d["v"],3),"z":d["z"],"b":d["b"]} for n,d in D.items()}}
  with open(STATE,"w",encoding="utf-8") as f:
   json.dump(state,f,ensure_ascii=False)
+ values={n:round(d["v"],3) for n,d in D.items()}
+ drive,value=top()
+ entry={"id":str(int(time.time()*1000)),"time":now.isoformat(),"drives":values,"top":{"drive":drive,"value":round(value["v"],3),"label":value["z"]}}
+ try:
+  rows=[json.loads(line) for line in HISTORY.read_text(encoding="utf-8").splitlines() if line.strip()] if HISTORY.exists() else []
+  latest=rows[-1] if rows else None
+  changed=not latest or latest.get("drives")!=values
+  due=not latest or time.time()-datetime.fromisoformat(latest["time"]).timestamp()>=600
+  if changed or due:rows.append(entry)
+  HISTORY.write_text("".join(json.dumps(row,ensure_ascii=False)+"\n" for row in rows[-2000:]),encoding="utf-8")
+ except Exception as e:print("[history错误]",e)
  return state
 
 def mark_online():
