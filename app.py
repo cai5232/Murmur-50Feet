@@ -33,6 +33,7 @@ REGRET=DATA_DIR/"regret.jsonl"
 MEM_LONG=DATA_DIR/"memory_long.txt"
 MEM_SHORT=DATA_DIR/"memory_short.txt"
 LAST=DATA_DIR/"last_result.json"
+HISTORY=DATA_DIR/"history.jsonl"
 CMD=DATA_DIR/"cmd.json"
 ORDER=["attachment","tenderness","heartache","curiosity","mischief","restless","regret","desire","gloom","jealousy"]
 
@@ -126,7 +127,11 @@ def internal_emotion(chat_id,operation="state"):
   if operation=="memory":
    return jsonify({"long":MEM_LONG.read_text(encoding="utf-8").strip() if MEM_LONG.exists() else "","short":MEM_SHORT.read_text(encoding="utf-8").strip() if MEM_SHORT.exists() else ""})
   if operation=="history":
-   return jsonify([])
+   rows=[json.loads(line) for line in HISTORY.read_text(encoding="utf-8").splitlines() if line.strip()] if HISTORY.exists() else []
+   hours=max(1,min(168,int(request.args.get("hours",24))))
+   count=max(1,min(2000,int(request.args.get("n",500))))
+   cutoff=time.time()-hours*3600
+   return jsonify([row for row in rows if __import__("datetime").datetime.fromisoformat(row["time"]).timestamp()>=cutoff][-count:])
   return jsonify({"error":"method_not_allowed"}),405
  data=request.get_json(silent=True) or {}
  if operation=="memory" or data.get("type")=="write_memory":
