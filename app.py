@@ -1,5 +1,5 @@
 from flask import Flask,jsonify,render_template,request
-import json,time,os,hmac
+import json,time,os,hmac,threading
 from pathlib import Path
 
 app=Flask(__name__)
@@ -148,3 +148,11 @@ def internal_emotion(chat_id,operation="state"):
    time.sleep(.1)
    if LAST.exists():return jsonify(json.loads(LAST.read_text(encoding="utf-8")))
  return jsonify({"ok":True})
+
+# The production container uses one Gunicorn worker. Start the persistent engine
+# once in that process and serve the dashboard/API through Gunicorn.
+import murmur as engine
+engine.load_state()
+engine.dump_state()
+threading.Thread(target=engine.tick_loop,daemon=True,name="murmur-tick").start()
+threading.Thread(target=engine.mloop,daemon=True,name="murmur-reflection").start()
