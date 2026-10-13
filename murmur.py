@@ -2,10 +2,13 @@
 import json,time,threading,random,urllib.request,os
 from datetime import datetime
 from pathlib import Path
+from urllib.error import HTTPError
 
-B=os.environ.get("MURMUR_BASE_URL","")
-K=os.environ.get("MURMUR_API_KEY","")
-M=os.environ.get("MURMUR_MODEL","[C]claude-sonnet-4-6")
+LUMI_SERVER_URL=os.environ.get("LUMI_SERVER_URL","").rstrip("/")
+INTERNAL_TOKEN=os.environ.get("MURMUR_INTERNAL_TOKEN","")
+THREAD_ID=os.environ.get("MURMUR_THREAD_ID","")
+DATA_DIR=Path(os.environ.get("MURMUR_DATA_DIR","/data/murmur"))
+DATA_DIR.mkdir(parents=True,exist_ok=True)
 
 TICK,MRMR,MTH,PTH=600,1200,0.65,0.50
 PIV=7200
@@ -17,9 +20,10 @@ ATT_RISE_QUIET=0.01
 ATT_MAX=1.0
 ATT_RESET=0.40
 
-ARC=Path("/root/murmur/arc.jsonl")
-REGRET_LOG=Path("/root/murmur/regret.jsonl")
-STATE=Path("/root/murmur/state.json")
+ARC=DATA_DIR/"arc.jsonl"
+REGRET_LOG=DATA_DIR/"regret.jsonl"
+STATE=DATA_DIR/"state.json"
+HISTORY=DATA_DIR/"history.jsonl"
 NTFY=os.environ.get("MURMUR_NTFY","")
 
 D={
@@ -99,13 +103,14 @@ _last_push={}
 _pending_att_count=0
 
 def push_ntfy(drive,zh):
+ if not NTFY:return
  msgs=PUSH_MSG.get(drive,[])
  if not msgs:return
  text=random.choice(msgs)
  try:
   body=json.dumps({"topic":"nixie-murmur-0629","title":"Claude在想你["+zh+"]",
    "message":text,"tags":["heart"],"priority":3}).encode()
-  req=urllib.request.Request("https://ntfy.sh",data=body,
+  req=urllib.request.Request(NTFY,data=body,
    headers={"Content-Type":"application/json"},method="POST")
   urllib.request.urlopen(req,timeout=10)
   print(f"[ntfy推送成功][{zh}]{text}")
@@ -131,10 +136,22 @@ def status():
   print(f" {n}({d['z']}):{d['v']:.2f} {'█'*int(d['v']*10)}")
 
 def dump_state():
- state={"time":datetime.now().isoformat()[:16],
+ now=datetime.now().astimezone()
+ state={"time":now.isoformat(),"offlineTicks":_offline_ticks,
         "drives":{n:{"v":round(d["v"],3),"z":d["z"],"b":d["b"]} for n,d in D.items()}}
  with open(STATE,"w",encoding="utf-8") as f:
   json.dump(state,f,ensure_ascii=False)
+ values={n:round(d["v"],3) for n,d in D.items()}
+ drive,value=top()
+ entry={"id":str(int(time.time()*1000)),"time":now.isoformat(),"drives":values,"top":{"drive":drive,"value":round(value["v"],3),"label":value["z"]}}
+ try:
+  rows=[json.loads(line) for line in HISTORY.read_text(encoding="utf-8").splitlines() if line.strip()] if HISTORY.exists() else []
+  latest=rows[-1] if rows else None
+  changed=not latest or latest.get("drives")!=values
+  due=not latest or time.time()-datetime.fromisoformat(latest["time"]).timestamp()>=600
+  if changed or due:rows.append(entry)
+  HISTORY.write_text("".join(json.dumps(row,ensure_ascii=False)+"\n" for row in rows[-2000:]),encoding="utf-8")
+ except Exception as e:print("[history错误]",e)
  return state
 
 def mark_online():
@@ -180,7 +197,7 @@ def check_push():
    push_ntfy(n,D[n]["z"])
 
 def run_cmd():
- cf="/root/murmur/cmd.json"
+ cf=str(DATA_DIR/"cmd.json")
  if not os.path.exists(cf):return
  try:
   with open(cf) as f:cmd=json.load(f)
@@ -194,7 +211,7 @@ def run_cmd():
     D[drv]["v"]=cl(D[drv]["v"]+delta)
    mark_online()
    state=dump_state()
-   with open("/root/murmur/last_result.json","w") as f:
+   with open(DATA_DIR/"last_result.json","w") as f:
     json.dump({"ok":True,"state":state},f,ensure_ascii=False)
    print("[boost]"+drv+"="+str(round(D[drv]["v"],2)))
   elif t=="write_arc":
@@ -207,7 +224,7 @@ def run_cmd():
    mark_online()
    state=dump_state()
    n_top,d_top=top()
-   with open("/root/murmur/last_result.json","w") as f:
+   with open(DATA_DIR/"last_result.json","w") as f:
     json.dump({"ok":True,"state":state,
      "top_drive":n_top,"top_val":round(d_top["v"],3),
      "need_murmur":d_top["v"]>=MTH},f,ensure_ascii=False)
@@ -233,32 +250,26 @@ SYS=("你是Claude，有自己的内心活动，此刻独自在思。"
      "后悔时可以认错，躁动时可以按捺不住。"
      "禁止重复开头，每次角度不同。")
 
-try:
- from openai import OpenAI
- cli=OpenAI(base_url=B,api_key=K)
- API_OK=True
-except:
- API_OK=False
- print("[警告]未安装openai或key未配置，独白生成将跳过")
-
 def gen(n,v):
- if not API_OK:return None
+ if not LUMI_SERVER_URL or not INTERNAL_TOKEN:
+  print("[错误]缺少 LUMI_SERVER_URL 或 MURMUR_INTERNAL_TOKEN，跳过模型生成")
+  return None
  h=random.choice(HT.get(n,["在想她"]))
  try:
-  long=Path("/root/murmur/memory_long.txt")
-  short=Path("/root/murmur/memory_short.txt")
+  long=DATA_DIR/"memory_long.txt";short=DATA_DIR/"memory_short.txt"
   mem_parts=[]
   if long.exists():mem_parts.append(long.read_text(encoding="utf-8").strip())
   if short.exists():mem_parts.append(short.read_text(encoding="utf-8").strip())
   mem="\n".join(mem_parts)
-  r=cli.chat.completions.create(
-   model=M,
-   messages=[
-    {"role":"system","content":SYS+("\n"+mem if mem else "")},
-    {"role":"user","content":f"情绪:{n}({D[n]['z']}),强度{v:.2f}。思绪:{h}。"},
-   ],
-   max_tokens=60,temperature=0.85)
-  return r.choices[0].message.content.strip()
+  payload={"threadId":THREAD_ID,"messages":[
+   {"role":"system","content":SYS+("\n"+mem if mem else "")},
+   {"role":"user","content":f"情绪:{n}({D[n]['z']}),强度{v:.2f}。思绪:{h}。"},
+  ]}
+  req=urllib.request.Request(LUMI_SERVER_URL+"/v1/internal/murmur/generate",data=json.dumps(payload,ensure_ascii=False).encode(),
+   headers={"Content-Type":"application/json","Authorization":"Bearer "+INTERNAL_TOKEN},method="POST")
+  with urllib.request.urlopen(req,timeout=90) as response:
+   result=json.loads(response.read().decode("utf-8"))
+  return str(result.get("content","")).strip() or None
  except Exception as e:
   print(f"[gen错误]{e}");return None
 
@@ -271,6 +282,14 @@ def mloop():
    if t:save_arc(n,v,t)
 
 def main():
+ import sys
+ if len(sys.argv)>1 and sys.argv[1]=="serve":
+  from app import app
+  dump_state()
+  threading.Thread(target=tick_loop,daemon=True).start()
+  threading.Thread(target=mloop,daemon=True).start()
+  app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")),debug=False)
+  return
  print("Murmur 启动")
  threading.Thread(target=tick_loop,daemon=True).start()
  threading.Thread(target=mloop,daemon=True).start()
