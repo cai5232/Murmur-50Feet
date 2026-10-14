@@ -109,7 +109,7 @@ if __name__=="__main__":
 @app.route("/internal/v1/chats/<chat_id>/emotion/<operation>",methods=["GET","POST"])
 @app.route("/internal/v1/chats/<chat_id>/emotion",methods=["GET","POST"])
 def internal_emotion(chat_id,operation="state"):
- if operation not in ("state","arc","history","regret","memory","activate"):return jsonify({"error":"unknown_emotion_operation"}),404
+ if operation not in ("state","arc","history","regret","memory","activate","update"):return jsonify({"error":"unknown_emotion_operation"}),404
  if request.method=="GET":
   if operation=="state":
    state=json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
@@ -134,6 +134,9 @@ def internal_emotion(chat_id,operation="state"):
    return jsonify([row for row in rows if __import__("datetime").datetime.fromisoformat(row["time"]).timestamp()>=cutoff][-count:])
   return jsonify({"error":"method_not_allowed"}),405
  data=request.get_json(silent=True) or {}
+ if operation=="update":
+  try:return jsonify(engine.apply_lumi_update(data))
+  except ValueError as error:return jsonify({"error":str(error)}),400
  if operation=="memory" or data.get("type")=="write_memory":
   field=MEM_LONG if data.get("scope")=="long" else MEM_SHORT
   maximum=20000 if field==MEM_LONG else 500

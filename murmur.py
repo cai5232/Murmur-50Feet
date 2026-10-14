@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import json,time,threading,random,urllib.request,os
+import json,time,threading,random,urllib.request,os,math,functools
+from zoneinfo import ZoneInfo
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError
@@ -36,6 +37,8 @@ D={
  "regret":     {"b":.10,"v":.10,"z":"后悔","d":.006},
  "desire":     {"b":.25,"v":.25,"z":"欲望","d":.006},
  "gloom":      {"b":.10,"v":.10,"z":"低落","d":.003},
+ "fatigue":    {"b":.12,"v":.12,"z":"疲惫","d":.010},
+ "anger":      {"b":.08,"v":.08,"z":"生气","d":.012},
  "jealousy":   {"b":.10,"v":.10,"z":"吃醋","d":.008},
 }
 
@@ -43,7 +46,20 @@ CP={("regret","heartache"):+0.20}
 
 _last_push={}
 _offline_ticks=0
-_lock=threading.Lock()
+_lock=threading.RLock()
+_lumi_integrated=False
+_applied_events=[]
+
+def synchronized(fn):
+ @functools.wraps(fn)
+ def wrapped(*args,**kwargs):
+  with _lock:return fn(*args,**kwargs)
+ return wrapped
+
+def atomic_json(path,value):
+ temporary=path.with_suffix(path.suffix+".tmp")
+ temporary.write_text(json.dumps(value,ensure_ascii=False),encoding="utf-8")
+ os.replace(temporary,path)
 
 PUSH_MSG={
  "attachment":[
@@ -94,7 +110,7 @@ HT={
 }
 
 cl=lambda v:max(0.,min(1.,v))
-qt=lambda:datetime.now().hour>=QS or datetime.now().hour<QE
+qt=lambda:datetime.now(ZoneInfo("Asia/Shanghai")).hour>=QS or datetime.now(ZoneInfo("Asia/Shanghai")).hour<QE
 top=lambda:max(D.items(),key=lambda x:x[1]["v"])
 
 _offline_ticks=0
@@ -136,7 +152,7 @@ def status():
   print(f" {n}({d['z']}):{d['v']:.2f} {'█'*int(d['v']*10)}")
 
 def load_state():
- global _offline_ticks
+ global _offline_ticks,_lumi_integrated,_applied_events
  if not STATE.exists():return
  try:
   state=json.loads(STATE.read_text(encoding="utf-8"))
@@ -145,14 +161,16 @@ def load_state():
    if name in D and isinstance(values,dict) and isinstance(values.get("v"),(int,float)):
     D[name]["v"]=cl(float(values["v"]))
   _offline_ticks=max(0,int(state.get("offlineTicks",0)))
+  _lumi_integrated=state.get("lumiIntegrated",False) is True
+  _applied_events=state.get("appliedEvents",[])[-1000:]
  except Exception as e:print(f"[state恢复失败]{e}")
 
+@synchronized
 def dump_state():
  now=datetime.now().astimezone()
- state={"time":now.isoformat(),"offlineTicks":_offline_ticks,
+ state={"time":now.isoformat(),"offlineTicks":_offline_ticks,"lumiIntegrated":_lumi_integrated,"appliedEvents":_applied_events,
         "drives":{n:{"v":round(d["v"],3),"z":d["z"],"b":d["b"]} for n,d in D.items()}}
- with open(STATE,"w",encoding="utf-8") as f:
-  json.dump(state,f,ensure_ascii=False)
+ atomic_json(STATE,state)
  values={n:round(d["v"],3) for n,d in D.items()}
  drive,value=top()
  entry={"id":str(int(time.time()*1000)),"time":now.isoformat(),"drives":values,"top":{"drive":drive,"value":round(value["v"],3),"label":value["z"]}}
@@ -162,15 +180,47 @@ def dump_state():
   changed=not latest or latest.get("drives")!=values
   due=not latest or time.time()-datetime.fromisoformat(latest["time"]).timestamp()>=600
   if changed or due:rows.append(entry)
-  HISTORY.write_text("".join(json.dumps(row,ensure_ascii=False)+"\n" for row in rows[-2000:]),encoding="utf-8")
+  temporary=HISTORY.with_suffix(".jsonl.tmp")
+  temporary.write_text("".join(json.dumps(row,ensure_ascii=False)+"\n" for row in rows[-2000:]),encoding="utf-8")
+  os.replace(temporary,HISTORY)
  except Exception as e:print("[history错误]",e)
  return state
 
+@synchronized
+def apply_lumi_update(data):
+ global _lumi_integrated,_applied_events
+ changes=data.get("changes",{})
+ if not isinstance(changes,dict):raise ValueError("changes must be an object")
+ if not changes and "drive" in data:changes={data["drive"]:data.get("delta")}
+ normalized={}
+ for name,value in changes.items():
+  if name not in D or isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
+   raise ValueError("invalid emotion change")
+  normalized[name]=max(-.2,min(.2,float(value)))
+ initial=data.get("initial_drives",{})
+ if not isinstance(initial,dict):raise ValueError("initial_drives must be an object")
+ if any(name not in D or isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) for name,value in initial.items()):
+  raise ValueError("invalid initial emotion state")
+ event_id=data.get("event_id","")
+ if not isinstance(event_id,str) or len(event_id)>128:raise ValueError("invalid event_id")
+ if event_id and event_id in _applied_events:
+  return {"ok":True,"duplicate":True,"state":json.loads(STATE.read_text(encoding="utf-8"))}
+ if not _lumi_integrated and initial:
+  for name,value in initial.items():D[name]["v"]=cl(float(value))
+  _lumi_integrated=True
+ if data.get("online") is True:mark_online()
+ for name,value in normalized.items():D[name]["v"]=cl(D[name]["v"]+value)
+ reason=data.get("reason")
+ if normalized.get("regret",0)>0 and isinstance(reason,str) and reason.strip():save_regret(reason.strip()[:500])
+ if event_id:_applied_events=(_applied_events+[event_id])[-1000:]
+ return {"ok":True,"state":dump_state()}
+
+@synchronized
 def mark_online():
  global _offline_ticks
  _offline_ticks=0
- D["attachment"]["v"]=cl(ATT_RESET)
 
+@synchronized
 def tick():
  global _offline_ticks
  for n,d in D.items():
@@ -208,6 +258,7 @@ def check_push():
    _last_push[n]=now
    push_ntfy(n,D[n]["z"])
 
+@synchronized
 def run_cmd():
  cf=str(DATA_DIR/"cmd.json")
  if not os.path.exists(cf):return
